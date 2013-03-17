@@ -45,6 +45,8 @@ function new(self)
         enable_esi      = false,
         enable_collapsed_forwarding = false,
         collapsed_forwarding_window = 60 * 1000,   -- Window for collapsed requests (ms)
+        use_fs = false,
+        fs_location = "/__serve_cache",
     }
 
     return setmetatable({ config = config }, mt)
@@ -1258,8 +1260,10 @@ function serve(self)
                 ngx.header[k] = v
             end
         end
-
-        if res.body then
+        if self:config_get("use_fs") then
+            ngx.log(ngx.DEBUG,'Serving From disk')
+            return ngx.exec(self:config_get('fs_location')..ngx.var.uri)
+        elseif res.body then
             ngx.print(res.body)
         end
 
