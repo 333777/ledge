@@ -45,6 +45,7 @@ function new(self)
         enable_esi      = false,
         enable_collapsed_forwarding = false,
         collapsed_forwarding_window = 60 * 1000,   -- Window for collapsed requests (ms)
+        webp = false,
     }
 
     return setmetatable({ config = config }, mt)
@@ -277,6 +278,14 @@ function cache_key(self)
         self:ctx().cache_key = table.concat(key_spec, ":")
     end
     return self:ctx().cache_key
+end
+
+function webp_key(self)
+    if not self:ctx().webp_key then
+        local key, _ = self:cache_key():gsub("cache_obj", "webp_body")
+        self.ctx().webp_key = key
+    end
+    return self.ctx().webp_key
 end
 
 
@@ -516,9 +525,21 @@ events = {
     },
 
     -- We have a response we can use. If it has been prepared, serve. If not, prepare it.
+    -- When we've refreshed the cache purge / rebuild webp version
     response_ready = {
+        { after = "updating_cache", begin = "checking_webp", but_first = "purge_webp"},
         { when = "preparing_response", begin = "serving" },
         { begin = "preparing_response" },
+    },
+
+    -- Push webp generation to queue
+    create_webp = {
+        { begin = "serving", but_first = "publish_webp" },
+    },
+
+    -- Not generating webp version
+    skip_webp = {
+        { begin = "serving"},
     },
 
     -- We've deduced we can serve a stale version of this URI. Ensure we add a warning to the
@@ -713,6 +734,13 @@ states = {
         else
             return self:e "cache_valid"
         end
+    end,
+
+    checking_webp = function(self)
+        if self:can_create_webp() then
+            return self:e "create_webp"
+        end
+        return self:e "skip_webp"
     end,
 
     checking_can_fetch = function(self)
@@ -1063,6 +1091,16 @@ function read_from_cache(self)
         res.header["Age"] = time_since_generated
     end
 
+    if self:can_serve_webp(res) then
+        local webp_body = self:ctx().redis:get(webp_key(self))
+
+        if webp_body ~= ngx.null then
+            ngx.log(ngx.DEBUG, 'Serving webp body')
+            res.body = webp_body
+            res.header["Content-Type"] = 'image/webp'
+        end
+    end
+
     self:emit("cache_accessed", res)
 
     return res
@@ -1207,6 +1245,42 @@ function save_to_cache(self, res)
     end
 end
 
+
+function can_create_webp(self)
+    -- Check config option is on
+    if not self:config_get('webp') then
+        return false
+    end
+
+    local res = self:get_response()
+    local content_type = res.header['Content-Type'] or ''
+
+    -- Make sure its a png or a jpeg
+    if content_type:find('png') ~= nil or content_type:find('jpeg') ~= nil then
+        return true
+    end
+    return false
+end
+
+
+function can_serve_webp(self, res)
+    -- Check config option is on
+    if not self:config_get('webp') then
+        return false
+    end
+    -- Check for jpeg or png
+    if res.header["Content-Type"]:find('png') == nil and res.header["Content-Type"]:find('jpeg') == nil then
+        return false
+    end
+    -- Check for browser support
+    if ngx.req.get_headers()['Accept']:find('webp') ~= nil then
+        return true
+    end
+    if ngx.req.get_headers()['User-Agent']:find('Chrome') ~=nil then
+        return true
+    end
+    return false
+end
 
 function delete_from_cache(self)
     return self:ctx().redis:del(self:cache_key())
