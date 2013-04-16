@@ -701,14 +701,22 @@ actions = {
             res.status = ngx.HTTP_INTERNAL_SERVER_ERROR
         end
     end,
+
+    purge_webp = function(self)
+        self:ctx().redis:del('WEBP', webp_key(self))
+    end,
+
+    publish_webp = function(self)
+        self:ctx().redis:rpush('WEBP', cache_key(self))
+    end,
 }
 
 
 ---------------------------------------------------------------------------------------------------
 -- Decision states.
 ---------------------------------------------------------------------------------------------------
--- Represented as functions which should simply make a decision, and return calling self:e(ev) with 
--- the event that has occurred. Place any further logic in actions triggered by the transition 
+-- Represented as functions which should simply make a decision, and return calling self:e(ev) with
+-- the event that has occurred. Place any further logic in actions triggered by the transition
 -- table.
 ---------------------------------------------------------------------------------------------------
 states = {
