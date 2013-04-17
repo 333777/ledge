@@ -703,7 +703,7 @@ actions = {
     end,
 
     purge_webp = function(self)
-        self:ctx().redis:del('WEBP', webp_key(self))
+        self:ctx().redis:del(webp_key(self))
     end,
 
     publish_webp = function(self)
@@ -731,7 +731,7 @@ states = {
             return self:e "cache_not_accepted"
         end
     end,
-    
+
     checking_cache = function(self)
         local res = self:get_response()
 
@@ -772,7 +772,7 @@ states = {
     requesting_collapse_lock = function(self)
         local redis = self:ctx().redis
         local lock_key = self:fetching_key()
-        
+
         local timeout = tonumber(self:config_get("collapsed_forwarding_window"))
         if not timeout then
             ngx.log(ngx.ERR, "collapsed_forwarding_window must be a number")
@@ -794,7 +794,7 @@ states = {
         -- Return: OK or BUSY
         local SETNEX = [[
             local lock = redis.call("GET", KEYS[1])
-            if not lock then    
+            if not lock then
                 return redis.call("PSETEX", KEYS[1], ARGV[1], "locked")
             else
                 return "BUSY"
@@ -852,7 +852,7 @@ states = {
             redis:unsubscribe()
 
             -- Returns either "collapsed_response_ready" or "collapsed_forwarding_failed"
-            return self:e(res[3]) 
+            return self:e(res[3])
         end
     end,
 
@@ -909,7 +909,7 @@ states = {
             return self:e "modified"
         end
     end,
-    
+
     revalidating_upstream = function(self)
         local res = self:get_response()
 
@@ -1004,10 +1004,10 @@ function e(self, event)
         ngx.status = ngx.HTTP_INTERNAL_SERVER_ERROR
         self:t("exiting")
     end
-    
+
     for _, trans in ipairs(self.events[event]) do
         if trans["when"] == nil or trans["when"] == ctx.current_state then
-            if not trans["after"] or ctx.state_history[trans["after"]] then 
+            if not trans["after"] or ctx.state_history[trans["after"]] then
                 if not trans["in_case"] or ctx.event_history[trans["in_case"]] then
                     if trans["but_first"] then
                         ngx.log(ngx.DEBUG, "#a: " .. trans["but_first"])
