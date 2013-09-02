@@ -6,11 +6,26 @@ local ipairs = ipairs
 local pairs = pairs
 local unpack = unpack
 local tostring = tostring
+local string_format = string.format
+local string_sub = string.sub
 local tonumber = tonumber
 local type = type
 local next = next
 local table = table
 local ngx = ngx
+local math_floor = math.floor
+
+local ffi = require("ffi")
+ffi.cdef[[
+  typedef long time_t;
+
+  typedef struct timeval {
+    time_t tv_sec;
+    time_t tv_usec;
+  } timeval;
+
+  int gettimeofday(struct timeval* t, void* tzp);
+]]
 
 module(...)
 
@@ -22,6 +37,66 @@ local redis = require "resty.redis"
 local response = require "ledge.response"
 local h_util = require "ledge.header_util"
 
+local gettimeofday_struct = ffi.new("timeval")
+local function gettimeofday()
+   ffi.C.gettimeofday(gettimeofday_struct, nil)
+   return tonumber(gettimeofday_struct.tv_sec) * 1000000 + tonumber(gettimeofday_struct.tv_usec)
+end
+
+local background_timing
+background_timing = function(premature, redis_hosts)
+    local shared_timing = ngx.shared.timing
+    local keys = shared_timing:get_keys(0)
+
+    local r = nil
+
+    for k,v in pairs(keys) do
+        -- Skip the running and count keys
+        if v ~= 'running' and string_sub(v, -6) ~= '_count' then
+            local total_time = shared_timing:get(v) or 0
+            local metric_count = shared_timing:get(v..'_count') or 0
+
+            if not r then
+                -- Connect to redis, do this in the loop so we dont bother if theres no data
+                -- TODO: Extract the redis connect logic from Ledge proper so we can re-use it
+                r = redis:new()
+                for _, conn in ipairs(redis_hosts) do
+                    ok, err = r:connect(conn.socket or conn.host, conn.port or 0)
+                    if ok then
+                        -- Attempt authentication.
+                        local password = conn.password
+                        if password then
+                            ok, err = r:auth(password)
+                        end
+                        -- Pipeline the publishes
+                        r:init_pipeline()
+                        break -- We're done
+                    end
+                end
+            end
+
+            -- Calculate the average time for each metric since last published
+            local duration = math_floor(total_time / metric_count)
+            local _,_ = r:publish('timing', v..':'..duration)
+
+            ngx.log(ngx.DEBUG, '[Background] '..v..' '..duration)
+            shared_timing:delete(v)
+            shared_timing:delete(v..'_count')
+        end
+    end
+    if r then
+        r:commit_pipeline()
+        ok, err = r:set_keepalive()
+    end
+
+    if premature then
+        -- worker is reloading, remove the flag
+        shared_timing:delete('running')
+        return
+    end
+    -- Call ourselves on a timer again
+    local ok, err = ngx.timer.at(1 , background_timing, redis_hosts)
+end
 
 -- Origin modes, for serving stale content during maintenance periods or emergencies.
 ORIGIN_MODE_BYPASS = 1 -- Never goes to the origin, serve from cache where possible or 503.
@@ -55,6 +130,36 @@ function new(self)
     return setmetatable({ config = config, }, mt)
 end
 
+function time_transition(self, name)
+    -- Get data from previous transition
+    local timing = self:ctx().timing
+    local last_transition = timing['last_transition']
+    local last_transition_name = timing['last_transition_name']
+
+    local duration = gettimeofday() - last_transition
+
+    local shared_timing = ngx.shared.timing
+
+    -- Add to the total duration for this transition and increment the count
+    local shared_duration = shared_timing:get(last_transition_name) or 0
+    local shared_count    = shared_timing:get(last_transition_name..'_count') or 0
+    local _,_,_ = shared_timing:set(last_transition_name, shared_duration + duration)
+    local _,_,_ = shared_timing:set(last_transition_name..'_count', shared_count + 1)
+
+    if shared_timing:get('running') == nil then
+        -- Start background thread to publish results
+        shared_timing:set('running', 1)
+        local ok, err = ngx.timer.at(1 , background_timing, self:config_get('redis_hosts'))
+    end
+
+    -- Reset transition data
+    timing['last_transition'] = gettimeofday()
+    timing['last_transition_name'] = name
+    self:ctx().timing = timing
+
+    -- return the formatted string back
+    return string_format("(%.3f ms)", duration / 1000)
+end
 
 -- A safe place in ngx.ctx for the current module instance (self).
 function ctx(self)
@@ -68,6 +173,10 @@ function ctx(self)
             event_history = {},
             current_state = "",
             client_validators = {},
+            timing = {
+                last_transition = 0,
+                last_transition_name = ''
+            },
         }
         ngx.ctx[id] = ctx
     end
@@ -123,10 +232,15 @@ end
 
 
 function run(self)
+    -- Initial timing data
+    self:ctx().timing['last_transition'] = gettimeofday()
+    self:ctx().timing['last_transition_name'] = 'run'
+
     local set, msg = ngx.on_abort(self:cleanup())
     if set == nil then
         ngx.log(ngx.WARN, "on_abort handler not set: "..msg)
     end
+
     self:e "init"
 end
 
@@ -1270,12 +1384,13 @@ function t(self, state)
 
     if pre_t then
         for _,action in ipairs(pre_t) do
-            ngx.log(ngx.DEBUG, "#a: " .. action)
+            local time_diff = self:time_transition(action)
+            ngx.log(ngx.DEBUG, time_diff.." #a: " .. action)
             self.actions[action](self)
         end
     end
-
-    ngx.log(ngx.DEBUG, "#t: " .. state)
+    local time_diff = self:time_transition(state)
+    ngx.log(ngx.DEBUG, time_diff.." #t: " .. state)
 
     ctx.state_history[state] = true
     ctx.current_state = state
@@ -1285,6 +1400,7 @@ end
 
 -- Process state transitions and actions based on the event fired.
 function e(self, event)
+    --local time_diff = self:time_transition(event)
     ngx.log(ngx.DEBUG, "#e: " .. event)
 
     local ctx = self:ctx()
@@ -1296,17 +1412,18 @@ function e(self, event)
         ngx.status = ngx.HTTP_INTERNAL_SERVER_ERROR
         self:t("exiting")
     end
-    
+
     for _, trans in ipairs(self.events[event]) do
         local t_when = trans["when"]
         if t_when == nil or t_when == ctx.current_state then
             local t_after = trans["after"]
-            if not t_after or ctx.state_history[t_after] then 
+            if not t_after or ctx.state_history[t_after] then
                 local t_in_case = trans["in_case"]
                 if not t_in_case or ctx.event_history[t_in_case] then
                     local t_but_first = trans["but_first"]
                     if t_but_first then
-                        ngx.log(ngx.DEBUG, "#a: " .. t_but_first)
+                        local time_diff = self:time_transition(t_but_first)
+                        ngx.log(ngx.DEBUG, time_diff.." #a: " .. t_but_first)
                         self.actions[t_but_first](self)
                     end
 
