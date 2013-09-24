@@ -44,18 +44,15 @@ local function gettimeofday()
 end
 
 local background_timing
-background_timing = function(premature, redis_hosts)
+background_timing = function(premature, redis_hosts, metrics)
     local shared_timing = ngx.shared.timing
-    local keys = shared_timing:get_keys(0)
-
     local r = nil
 
-    for k,v in pairs(keys) do
-        -- Skip the running and count keys
-        if v ~= 'running' and string_sub(v, -6) ~= '_count' then
-            local total_time = shared_timing:get(v) or 0
-            local metric_count = shared_timing:get(v..'_count') or 0
+    for _,v in ipairs(metrics) do
+        local total_time = shared_timing:get(v)
+        local metric_count = shared_timing:get(v..'_count')
 
+        if total_time and metric_count then
             if not r then
                 -- Connect to redis, do this in the loop so we dont bother if theres no data
                 -- TODO: Extract the redis connect logic from Ledge proper so we can re-use it
@@ -95,7 +92,7 @@ background_timing = function(premature, redis_hosts)
         return
     end
     -- Call ourselves on a timer again
-    local ok, err = ngx.timer.at(1 , background_timing, redis_hosts)
+    local ok, err = ngx.timer.at(1 , background_timing, redis_hosts, metrics)
 end
 
 -- Origin modes, for serving stale content during maintenance periods or emergencies.
@@ -147,9 +144,17 @@ function time_transition(self, name)
     local _,_,_ = shared_timing:set(last_transition_name..'_count', shared_count + 1)
 
     if shared_timing:get('running') == nil then
+        -- Get list of all states and actions
+        local metrics = {}
+        for k,_ in pairs(self.states) do
+            table.insert(metrics, k)
+        end
+        for k,_ in pairs(self.actions) do
+            table.insert(metrics, k)
+        end
         -- Start background thread to publish results
         shared_timing:set('running', 1)
-        local ok, err = ngx.timer.at(1 , background_timing, self:config_get('redis_hosts'))
+        local ok, err = ngx.timer.at(1 , background_timing, self:config_get('redis_hosts'), metrics)
     end
 
     -- Reset transition data
