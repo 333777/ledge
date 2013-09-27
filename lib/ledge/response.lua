@@ -18,7 +18,7 @@ local h_util = require "ledge.header_util"
 
 
 function new(self, response)
-    local body = ""
+    local body = nil
     local header = {}
     local status = nil
 

@@ -34,7 +34,7 @@ function new(self)
         origin_location = "/__ledge_origin",
         origin_mode     = ORIGIN_MODE_NORMAL,
 
-        redis_database  = 0,
+        redis_database  = 1,
         redis_timeout   = 100,          -- Connect and read timeout (ms)
         redis_keepalive_timeout = nil,  -- Defaults to 60s or lua_socket_keepalive_timeout
         redis_keepalive_poolsize = nil, -- Defaults to 30 or lua_socket_pool_size
@@ -347,7 +347,16 @@ end
 
 
 function cache_key(self)
-    if not self:ctx().cache_key then
+    return self:gen_cache_key("obj")
+end
+
+function cache_bodykey(self)
+    return self:gen_cache_key("body")
+end
+
+function gen_cache_key(self, key_id)
+    local id = "cache_"..key_id.."key"
+    if not self:ctx()[id] then
         -- Generate the cache key. The default spec is:
         -- ledge:cache_obj:http:example.com:/about:p=3&q=searchterms
         local key_spec = self:config_get("cache_key_spec") or {
@@ -356,13 +365,12 @@ function cache_key(self)
             ngx.var.uri,
             ngx.var.args,
         }
-        table.insert(key_spec, 1, "cache_obj")
+        table.insert(key_spec, 1, "cache_"..key_id)
         table.insert(key_spec, 1, "ledge")
-        self:ctx().cache_key = table.concat(key_spec, ":")
+        self:ctx()[id] = table.concat(key_spec, ":")
     end
-    return self:ctx().cache_key
+    return self:ctx()[id]
 end
-
 
 function fetching_key(self)
     return self:cache_key() .. ":fetching"
@@ -1516,7 +1524,7 @@ function save_to_cache(self, res)
     local uri = full_uri()
 
     redis:hmset(cache_key(self),
-        'body', res.body,
+        --'body', res.body,
         'status', res.status,
         'uri', uri,
         'expires', expires,
@@ -1533,6 +1541,20 @@ function save_to_cache(self, res)
         if res:has_esi_vars() then redis:hmset(cache_key(self), "esi_vars", 1) end
     end
 
+    -- Save chunked body to list
+    local body_key = self:cache_bodykey()
+    redis:del(body_key)
+    local chunk = 16384
+    local count = 0
+    local body = res.body
+    repeat
+        local data = body:sub(chunk*count, chunk*(count+1) )
+        count = count + 1
+        redis:rpush(body_key, data)
+    until #data < chunk
+
+    -- Expire keys
+    redis:expire(body_key, ttl + tonumber(self:config_get("keep_cache_for")))
     redis:expire(cache_key(self), ttl + tonumber(self:config_get("keep_cache_for")))
 
     -- Add this to the uris_by_expiry sorted set, for cache priming and analysis
@@ -1606,8 +1628,22 @@ function serve(self)
             end
         end
 
-        if res.status ~= 304 and res.body then
-            ngx.print(res.body)
+        if res.status ~= 304 and ngx.status ~= ngx.HTTP_NOT_MODIFIED then
+            if res.body then
+                ngx.print(res.body)
+            else
+                local count = 0
+                local redis = self:ctx().redis
+                local body_key = self:cache_bodykey()
+                repeat
+                    local data,err = redis:lindex(body_key, count)
+                    count = count + 1
+                    if data ~= ngx.null then
+                        ngx.print(data)
+                        ngx.flush()
+                    end
+                until data == ngx.null
+            end
         end
 
         ngx.eof()
