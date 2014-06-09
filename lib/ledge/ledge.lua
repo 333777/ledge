@@ -162,6 +162,10 @@ function _M.new(self)
 
         enable_collapsed_forwarding = false,
         collapsed_forwarding_window = 60 * 1000, -- Window for collapsed requests (ms)
+
+        upstream = nil,
+        fastcgi = nil,
+        fastcgi_params = nil,
     }
 
     return setmetatable({ config = config }, mt)
@@ -985,12 +989,12 @@ _M.actions = {
         return self:redis_close()
     end,
 
-    httpc_close = function(self)
+    origin_client_close = function(self)
         local res = self:get_response()
         if res then
-            local httpc = res.conn
-            if httpc then
-                return httpc:set_keepalive()
+            local origin_client = res.conn
+            if origin_client then
+                return origin_client:set_keepalive()
             end
         end
     end,
@@ -1467,7 +1471,7 @@ _M.states = {
 
         if res.status >= 500 then
             return self:e "upstream_error"
-        elseif res.status == ngx.HTTP_NOT_MODIFIED then
+        elseif res.status == ngx.HTTP_NOT_MODIFIED or res.status == 411 then
             return self:e "response_ready"
         else
             return self:e "response_fetched"
@@ -1744,6 +1748,46 @@ function _M.read_from_cache(self)
 end
 
 
+local function get_origin_client(self)
+    local upstream = self:config_get("upstream")
+    if upstream then
+        return upstream, "upstream"
+    end
+
+    -- Everything else will require upstream host / port
+    local upstream_host = self:config_get("upstream_host")
+    local upstream_port = self:config_get("upstream_port")
+
+    local fastcgi = self:config_get("fastcgi")
+    if fastcgi then
+        local ok,err
+        if upstream_port then
+            ok,err = fastcgi:connect(upstream_host, upstream_port)
+        else
+            ok,err = fastcgi:connect(upstream_host)
+        end
+
+        if not ok then
+            ngx_log(ngx_ERR, err)
+            return nil, err
+        end
+        return fastcgi, "fastcgi"
+    end
+
+    local httpc = http.new()
+    local ok,err
+    if upstream_port then
+        ok,err = httpc:connect(upstream_host, upstream_port)
+    else
+        ok,err = httpc:connect(upstream_host)
+    end
+    if not ok then
+        ngx_log(ngx_ERR, err)
+        return nil, err
+    end
+    return httpc, "http"
+end
+
 -- Fetches a resource from the origin server.
 function _M.fetch_from_origin(self)
     local res = response.new()
@@ -1756,24 +1800,38 @@ function _M.fetch_from_origin(self)
         return res
     end
 
-    ngx.req.read_body() -- Must read body into lua when passing options into location.capture
+    local origin_client, client_type = get_origin_client(self)
+    if not origin_client then
+        return res
+    end
 
-    local httpc = http.new()
-    httpc:connect(self:config_get("upstream_host"), self:config_get("upstream_port"))
-    
-    local origin, err = httpc:request{
+    local client_body_reader, err = origin_client:get_client_body_reader()
+    if not client_body_reader then
+          if err == "chunked request bodies not supported yet" then
+              res.status = 411
+              res.body = "411 Length Required"
+              return res
+          end
+    end
+
+    local req_params = {
         method = ngx_req_get_method(),
         path = self:relative_uri(),
-        body = ngx.req.get_body_data(), -- TODO: stream this into httpc?
+        body = client_body_reader,
         headers = ngx_req_get_headers(),
     }
 
+    if client_type == "fastcgi" then
+        req_params.fastcgi = self:config_get("fastcgi_params")
+    end
+
+    local origin, err = origin_client:request(req_params)
     if not origin then
         ngx_log(ngx_ERR, err)
         return res
     end
     
-    res.conn = httpc
+    res.conn = origin_client
     res.status = origin.status
 
     -- Merge end-to-end headers
