@@ -256,7 +256,7 @@ function _M.run_workers(self, options)
             perform = self:get_collect_entity_job_spec(),
         }
     }
-
+    options = options or {}
     worker:start(job_specs, {
         interval = options.interval or 10,
         concurrency = options.concurrency or 1,
@@ -949,8 +949,8 @@ _M.events = {
 -- Pre-transitions. Actions to always perform before transitioning.
 ---------------------------------------------------------------------------------------------------
 _M.pre_transitions = {
-    exiting = { "redis_close", "origin_close" },
-    exiting_worker = { "redis_close", "origin_close" },
+    exiting = { "redis_close", "origin_client_close" },
+    exiting_worker = { "redis_close", "origin_client_close" },
     checking_cache = { "read_cache" },
     -- Never fetch with client validators, but put them back afterwards.
     fetching = {
