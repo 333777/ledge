@@ -949,8 +949,8 @@ _M.events = {
 -- Pre-transitions. Actions to always perform before transitioning.
 ---------------------------------------------------------------------------------------------------
 _M.pre_transitions = {
-    exiting = { "redis_close", "httpc_close" },
-    exiting_worker = { "redis_close", "httpc_close" },
+    exiting = { "redis_close", "origin_close" },
+    exiting_worker = { "redis_close", "origin_close" },
     checking_cache = { "read_cache" },
     -- Never fetch with client validators, but put them back afterwards.
     fetching = {
